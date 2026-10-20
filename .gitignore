@@ -6,3 +6,16 @@ lab2/src/revert_string/build/
 lab2/src/revert_string/revert_string
 lab2/src/swap/swap
 lab2/src/tests/tests
+# Lab 3 executables
+/lab3/src/parallel_min_max
+/lab3/src/sequential_min_max
+/lab3/src/run_min_max
+
+# Lab 4 executables
+/lab4/src/parallel_min_max
+/lab4/src/parallel_sum
+/lab4/src/process_memory
+/lab4/src/zombie_demo
+
+# Temporary files
+/lab4/src/result_*.txt
