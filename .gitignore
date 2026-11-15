@@ -19,3 +19,8 @@ lab2/src/tests/tests
 
 # Temporary files
 /lab4/src/result_*.txt
+
+/lab5/src/deadlock
+/lab5/src/factorial
+/lab5/src/mutex_no
+/lab5/src/mutex_yes
