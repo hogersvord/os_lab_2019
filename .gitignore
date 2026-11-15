@@ -24,3 +24,10 @@ lab2/src/tests/tests
 /lab5/src/factorial
 /lab5/src/mutex_no
 /lab5/src/mutex_yes
+
+# Лабораторная 6
+/lab6/src/client
+/lab6/src/server
+/lab6/src/*.o
+/lab6/src/*.a
+/lab6/src/*.log

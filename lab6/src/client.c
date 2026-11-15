@@ -1,14 +1,14 @@
 #include <stdbool.h>
+#include <stdint.h>  // ИЗМЕНЕНО: тип uint64_t
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
+#include "common.h" // ЗАДАНИЕ 3: общая библиотека
 #include <errno.h>
 #include <getopt.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/ip.h>
+#include <arpa/inet.h>  // ИЗМЕНЕНО: inet_pton для IPv4
+#include <pthread.h>    // ИЗМЕНЕНО: потоки для параллельной работы с серверами
 #include <sys/socket.h>
 #include <sys/types.h>
 
@@ -17,148 +17,292 @@ struct Server {
   int port;
 };
 
-uint64_t MultModulo(uint64_t a, uint64_t b, uint64_t mod) {
-  uint64_t result = 0;
-  a = a % mod;
-  while (b > 0) {
-    if (b % 2 == 1)
-      result = (result + a) % mod;
-    a = (a * 2) % mod;
-    b /= 2;
-  }
+// ИЗМЕНЕНО: каждому потоку передаём свой сервер, диапазон и место для ответа.
+struct ServerTask {
+  struct Server server;
+  uint64_t begin;
+  uint64_t end;
+  uint64_t mod;
+  uint64_t answer;
+  bool success;
+};
 
-  return result % mod;
-}
+
 
 bool ConvertStringToUI64(const char *str, uint64_t *val) {
+  // ИЗМЕНЕНО: проверяем строку целиком и сбрасываем errno до преобразования.
+  if (!str || !*str || *str == '-')
+    return false;
+
+  errno = 0;
   char *end = NULL;
-  unsigned long long i = strtoull(str, &end, 10);
-  if (errno == ERANGE) {
-    fprintf(stderr, "Out of uint64_t range: %s\n", str);
-    return false;
-  }
-
-  if (errno != 0)
+  unsigned long long value = strtoull(str, &end, 10);
+  if (errno != 0 || end == str || *end != '\0')
     return false;
 
-  *val = i;
+  *val = (uint64_t)value;
   return true;
 }
 
+// ИЗМЕНЕНО: функция одного потока клиента. Каждый поток обращается
+// к СВОЕМУ серверу; исходные send/recv перенесены сюда из цикла main().
+void *ContactServer(void *arg) {
+  struct ServerTask *task = (struct ServerTask *)arg;
+  task->success = false;
+
+  struct sockaddr_in server = {0};
+  server.sin_family = AF_INET;
+  server.sin_port = htons((uint16_t)task->server.port);
+  if (inet_pton(AF_INET, task->server.ip, &server.sin_addr) != 1) {
+    fprintf(stderr, "Invalid IP: %s\n", task->server.ip);
+    return NULL;
+  }
+
+  int sck = socket(AF_INET, SOCK_STREAM, 0);
+  if (sck < 0) {
+    perror("socket");
+    return NULL;
+  }
+
+  if (connect(sck, (struct sockaddr *)&server, sizeof(server)) < 0) {
+    fprintf(stderr, "Connection to %s:%d failed: %s\n",
+            task->server.ip, task->server.port, strerror(errno));
+    close(sck);
+    return NULL;
+  }
+
+  // ИЗМЕНЕНО: сигнатура FACT защищает сервер от HTTP-запросов Codespaces.
+  // Числа по-прежнему передаются в порядке байтов этой машины.
+  char request[4 + sizeof(uint64_t) * 3];
+  memcpy(request, "FACT", 4);
+  memcpy(request + 4, &task->begin, sizeof(uint64_t));
+  memcpy(request + 4 + sizeof(uint64_t), &task->end, sizeof(uint64_t));
+  memcpy(request + 4 + 2 * sizeof(uint64_t), &task->mod, sizeof(uint64_t));
+
+  // ИЗМЕНЕНО: TCP может отправить только часть сообщения за один send().
+  size_t sent = 0;
+  while (sent < sizeof(request)) {
+    ssize_t n = send(sck, request + sent, sizeof(request) - sent,
+                     MSG_NOSIGNAL);
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0) {
+      fprintf(stderr, "Send to %s:%d failed\n",
+              task->server.ip, task->server.port);
+      close(sck);
+      return NULL;
+    }
+    sent += (size_t)n;
+  }
+
+  // ИЗМЕНЕНО: recv() тоже может получить ответ по частям.
+  char response[sizeof(uint64_t)];
+  size_t received = 0;
+  while (received < sizeof(response)) {
+    ssize_t n = recv(sck, response + received,
+                     sizeof(response) - received, 0);
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0) {
+      fprintf(stderr, "Receive from %s:%d failed\n",
+              task->server.ip, task->server.port);
+      close(sck);
+      return NULL;
+    }
+    received += (size_t)n;
+  }
+
+  memcpy(&task->answer, response, sizeof(uint64_t));
+  task->success = true;
+  close(sck);
+  return NULL;
+}
+
 int main(int argc, char **argv) {
-  uint64_t k = -1;
-  uint64_t mod = -1;
-  char servers[255] = {'\0'}; // TODO: explain why 255
+  uint64_t k = 0;
+  uint64_t mod = 0;
+  bool have_k = false, have_mod = false;  // ИЗМЕНЕНО: отличаем отсутствие от 0.
+  char servers[255] = {'\0'}; // Путь к файлу (255 — размер буфера пути).
 
   while (true) {
-    int current_optind = optind ? optind : 1;
-
     static struct option options[] = {{"k", required_argument, 0, 0},
                                       {"mod", required_argument, 0, 0},
                                       {"servers", required_argument, 0, 0},
                                       {0, 0, 0, 0}};
-
     int option_index = 0;
     int c = getopt_long(argc, argv, "", options, &option_index);
-
     if (c == -1)
       break;
 
     switch (c) {
-    case 0: {
+    case 0:
       switch (option_index) {
       case 0:
-        ConvertStringToUI64(optarg, &k);
-        // TODO: your code here
+        // ИЗМЕНЕНО: обработка TODO для --k.
+        have_k = ConvertStringToUI64(optarg, &k);
+        if (!have_k) {
+          fprintf(stderr, "Invalid k\n");
+          return 1;
+        }
         break;
       case 1:
-        ConvertStringToUI64(optarg, &mod);
-        // TODO: your code here
+        // ИЗМЕНЕНО: обработка TODO для --mod.
+        have_mod = ConvertStringToUI64(optarg, &mod);
+        if (!have_mod || mod == 0) {
+          fprintf(stderr, "Invalid mod: must be positive\n");
+          return 1;
+        }
         break;
       case 2:
-        // TODO: your code here
-        memcpy(servers, optarg, strlen(optarg));
+        // ИЗМЕНЕНО: копируем путь с проверкой длины (без переполнения).
+        if (strlen(optarg) >= sizeof(servers)) {
+          fprintf(stderr, "Servers path is too long\n");
+          return 1;
+        }
+        strcpy(servers, optarg);
         break;
       default:
-        printf("Index %d is out of options\n", option_index);
+        fprintf(stderr, "Unknown option index %d\n", option_index);
+        return 1;
       }
-    } break;
-
-    case '?':
-      printf("Arguments error\n");
       break;
+    case '?':
+      fprintf(stderr, "Arguments error\n");
+      return 1;
     default:
-      fprintf(stderr, "getopt returned character code 0%o?\n", c);
+      return 1;
     }
   }
 
-  if (k == -1 || mod == -1 || !strlen(servers)) {
-    fprintf(stderr, "Using: %s --k 1000 --mod 5 --servers /path/to/file\n",
+  if (!have_k || !have_mod || !servers[0] || optind != argc) {
+    fprintf(stderr, "Using: %s --k 10 --mod 7 --servers servers.txt\n",
             argv[0]);
     return 1;
   }
 
-  // TODO: for one server here, rewrite with servers from file
-  unsigned int servers_num = 1;
-  struct Server *to = malloc(sizeof(struct Server) * servers_num);
-  // TODO: delete this and parallel work between servers
-  to[0].port = 20001;
-  memcpy(to[0].ip, "127.0.0.1", sizeof("127.0.0.1"));
-
-  // TODO: work continiously, rewrite to make parallel
-  for (int i = 0; i < servers_num; i++) {
-    struct hostent *hostname = gethostbyname(to[i].ip);
-    if (hostname == NULL) {
-      fprintf(stderr, "gethostbyname failed with %s\n", to[i].ip);
-      exit(1);
-    }
-
-    struct sockaddr_in server;
-    server.sin_family = AF_INET;
-    server.sin_port = htons(to[i].port);
-    server.sin_addr.s_addr = *((unsigned long *)hostname->h_addr);
-
-    int sck = socket(AF_INET, SOCK_STREAM, 0);
-    if (sck < 0) {
-      fprintf(stderr, "Socket creation failed!\n");
-      exit(1);
-    }
-
-    if (connect(sck, (struct sockaddr *)&server, sizeof(server)) < 0) {
-      fprintf(stderr, "Connection failed\n");
-      exit(1);
-    }
-
-    // TODO: for one server
-    // parallel between servers
-    uint64_t begin = 1;
-    uint64_t end = k;
-
-    char task[sizeof(uint64_t) * 3];
-    memcpy(task, &begin, sizeof(uint64_t));
-    memcpy(task + sizeof(uint64_t), &end, sizeof(uint64_t));
-    memcpy(task + 2 * sizeof(uint64_t), &mod, sizeof(uint64_t));
-
-    if (send(sck, task, sizeof(task), 0) < 0) {
-      fprintf(stderr, "Send failed\n");
-      exit(1);
-    }
-
-    char response[sizeof(uint64_t)];
-    if (recv(sck, response, sizeof(response), 0) < 0) {
-      fprintf(stderr, "Recieve failed\n");
-      exit(1);
-    }
-
-    // TODO: from one server
-    // unite results
-    uint64_t answer = 0;
-    memcpy(&answer, response, sizeof(uint64_t));
-    printf("answer: %llu\n", answer);
-
-    close(sck);
+  // ИЗМЕНЕНО: вместо одного жёстко заданного сервера читаем servers.txt.
+  FILE *file = fopen(servers, "r");
+  if (!file) {
+    perror("fopen servers");
+    return 1;
   }
-  free(to);
 
-  return 0;
+  struct Server *to = NULL;
+  size_t servers_num = 0;
+  char line[512];
+
+  while (fgets(line, sizeof(line), file)) {
+    if (line[0] == '\n' || line[0] == '#')
+      continue;
+
+    struct Server entry = {0};
+    char extra;
+    struct in_addr addr;
+
+    // Формат строки: 127.0.0.1:20001
+    if (sscanf(line, " %254[^:]:%d %c", entry.ip,
+               &entry.port, &extra) != 2 ||
+        entry.port < 1 || entry.port > 65535 ||
+        inet_pton(AF_INET, entry.ip, &addr) != 1) {
+      fprintf(stderr, "Invalid server entry: %s", line);
+      free(to);
+      fclose(file);
+      return 1;
+    }
+
+    struct Server *tmp = realloc(to, (servers_num + 1) * sizeof(*to));
+    if (!tmp) {
+      perror("realloc");
+      free(to);
+      fclose(file);
+      return 1;
+    }
+    to = tmp;
+    to[servers_num++] = entry;
+  }
+
+  if (ferror(file)) {
+    perror("read servers");
+    free(to);
+    fclose(file);
+    return 1;
+  }
+  fclose(file);
+
+  if (servers_num == 0) {
+    fprintf(stderr, "Servers file is empty\n");
+    free(to);
+    return 1;
+  }
+
+  // ИЗМЕНЕНО: готовим диапазоны и потоки для ВСЕХ серверов.
+  pthread_t *threads = calloc(servers_num, sizeof(*threads));
+  struct ServerTask *tasks = calloc(servers_num, sizeof(*tasks));
+  if (!threads || !tasks) {
+    perror("calloc");
+    free(threads);
+    free(tasks);
+    free(to);
+    return 1;
+  }
+
+  uint64_t base = k / servers_num;
+  uint64_t remainder = k % servers_num;
+  uint64_t next = 1;
+  size_t created = 0;
+
+  // ИЗМЕНЕНО: запускаем потоки в цикле, не дожидаясь предыдущего.
+  for (size_t i = 0; i < servers_num; i++) {
+    uint64_t count = base + (i < remainder);
+    tasks[i].server = to[i];
+    tasks[i].mod = mod;
+
+    if (count > 0) {
+      tasks[i].begin = next;
+      tasks[i].end = next + count - 1;
+      if (i + 1 < servers_num)
+        next += count;
+    } else {
+      // Пустой диапазон: сервер вернёт нейтральный множитель 1 mod mod.
+      tasks[i].begin = 1;
+      tasks[i].end = 0;
+    }
+
+    printf("Server %zu (%s:%d): [%llu, %llu]\n", i + 1,
+           to[i].ip, to[i].port,
+           (unsigned long long)tasks[i].begin,
+           (unsigned long long)tasks[i].end);
+
+    int err = pthread_create(&threads[i], NULL, ContactServer, &tasks[i]);
+    if (err != 0) {
+      fprintf(stderr, "pthread_create: %s\n", strerror(err));
+      break;
+    }
+    created++;
+  }
+
+  // ИЗМЕНЕНО: ждём ответы и объединяем частичные произведения по модулю.
+  uint64_t answer = 1 % mod;
+  bool ok = (created == servers_num);
+  for (size_t i = 0; i < created; i++) {
+    int err = pthread_join(threads[i], NULL);
+    if (err != 0 || !tasks[i].success) {
+      fprintf(stderr, "Server %zu failed\n", i + 1);
+      ok = false;
+      continue;
+    }
+    printf("Server %zu returned: %llu\n", i + 1,
+           (unsigned long long)tasks[i].answer);
+    answer = MultModulo(answer, tasks[i].answer, mod);
+  }
+
+  if (ok)
+    printf("answer: %llu\n", (unsigned long long)answer);
+  else
+    fprintf(stderr, "Calculation failed\n");
+
+  free(threads);
+  free(tasks);
+  free(to);
+  return ok ? 0 : 1;
 }
